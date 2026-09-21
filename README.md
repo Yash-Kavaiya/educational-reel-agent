@@ -7,11 +7,15 @@ Google ADK agent + FastAPI service that turns a topic into a vertical educationa
 | | |
 | --- | --- |
 | Package | `agent` (`root_agent` = `educational_reel_creator`) |
+| LLM | LiteLLM + Vercel AI Gateway |
+| Agent model | `inclusionai/ling-3.0-flash-fin-free` (free) |
+| Eval model | `typesafe-ai/jev` (free) |
+| ADK | `google-adk` ≥ 2.9.2 |
 | API | FastAPI on port **8080** — [OpenAPI at `/docs`](http://127.0.0.1:8080/docs) |
 | Render | `python -m reelgen build` + `SARVAM_API_KEY` |
 | Theme | Oracle Red `#E01C24` / Orange `#FF6600` on `#0D0D0D` |
 | Handle | `@genai_guru` |
-| Version | 1.1.0 |
+| Version | 1.2.0 |
 | Python | 3.11+ |
 
 [![Python 3.11+](https://img.shields.io/badge/python-3.11+-3776AB?logo=python&logoColor=white)](https://www.python.org/downloads/)
@@ -27,7 +31,8 @@ Repository: https://github.com/Yash-Kavaiya/educational-reel-agent
 ## Contents
 
 1. [What it does](#what-it-does)
-2. [Quick start](#quick-start)
+2. [Models (Vercel AI Gateway + LiteLLM)](#models-vercel-ai-gateway--litellm)
+3. [Quick start](#quick-start)
 3. [Run with Google ADK](#run-with-google-adk)
 4. [HTTP API](#http-api)
 5. [Storyboard JSON](#storyboard-json)
@@ -68,6 +73,42 @@ topic + content
 | Health | `GET /health` — no secrets in the body |
 
 Storyboard and social-copy work **without** a Sarvam key. Render and pipeline-with-render return an error until `SARVAM_API_KEY` is set.
+
+---
+
+## Models (Vercel AI Gateway + LiteLLM)
+
+The agent does **not** call Gemini directly. Google ADK 2.9+ uses [`LiteLlm`](https://google.github.io/adk-docs/agents/models/) and LiteLLM talks to [Vercel AI Gateway](https://vercel.com/docs/ai-gateway/ecosystem/framework-integrations/litellm).
+
+| Role | Model id | LiteLLM string | Notes |
+| --- | --- | --- | --- |
+| Agent (chat + tools) | [`inclusionai/ling-3.0-flash-fin-free`](https://vercel.com/ai-gateway/models/ling-3.0-flash-fin-free) | `vercel_ai_gateway/inclusionai/ling-3.0-flash-fin-free` | Free. Function calling, 256K context |
+| Evaluation | [`typesafe-ai/jev`](https://vercel.com/ai-gateway/models/jev) | `vercel_ai_gateway/typesafe-ai/jev` | Free. Structured yes/no / scores via `evaluate_with_jev` |
+
+Jev is an evaluation model, not a tool-calling LLM. Ling creates storyboards and calls tools. Jev scores them.
+
+Auth (either name):
+
+```bash
+# https://vercel.com/account/ai-gateway — create a key
+export VERCEL_AI_GATEWAY_API_KEY=...   # LiteLLM official env
+# or
+export AI_GATEWAY_API_KEY=...
+```
+
+Python equivalent of the AI SDK `streamText({ model: 'inclusionai/ling-3.0-flash-fin-free' })` snippet:
+
+```python
+import litellm
+
+response = litellm.completion(
+    model="vercel_ai_gateway/inclusionai/ling-3.0-flash-fin-free",
+    messages=[{"role": "user", "content": "Why is the sky blue?"}],
+)
+print(response.choices[0].message.content)
+```
+
+Override with `ADK_MODEL` / `JEV_MODEL` in `.env`.
 
 ---
 
@@ -145,6 +186,7 @@ Tools registered on the agent:
 | `batch_render_reels` | Storyboard + render a list of topics |
 | `generate_social_copy` | Platform captions |
 | `upload_video_to_youtube` | Upload an mp4 under `OUTPUT_DIR` |
+| `evaluate_with_jev` | TypeSafe Jev structured evaluation |
 
 The agent is instructed not to invent file paths and not to claim a video exists if render failed.
 
@@ -167,6 +209,7 @@ Base URL: `http://127.0.0.1:8080`
 | `POST` | `/api/v1/render` | yes | Render one board |
 | `POST` | `/api/v1/batch-render` | yes | Series of topics |
 | `POST` | `/api/v1/social-copy` | yes | Captions |
+| `POST` | `/api/v1/evaluate` | yes | TypeSafe Jev via LiteLLM |
 | `POST` | `/api/v1/pipeline` | yes | Full flow. `upload_youtube` requires `render=true` |
 | `POST` | `/api/v1/youtube/upload` | yes | mp4 must be under `OUTPUT_DIR` |
 | `GET` | `/api/v1/outputs` | yes | List mp4s. Query `?series=` |
@@ -297,9 +340,12 @@ Copy `.env.example` to `.env`. Loaded by `pydantic-settings` in `agent/config.py
 | Variable | Default | Required | Purpose |
 | --- | --- | --- | --- |
 | `SARVAM_API_KEY` | empty | for render | Sarvam TTS. Never commit this |
+| `VERCEL_AI_GATEWAY_API_KEY` | empty | for ADK chat + Jev | LiteLLM official key name |
+| `AI_GATEWAY_API_KEY` | empty | for ADK chat + Jev | Alias if Vercel key unset |
 | `GOOGLE_CLOUD_PROJECT` | empty | Cloud Run | GCP project id |
 | `GOOGLE_CLOUD_REGION` | `us-central1` | no | Region |
-| `ADK_MODEL` | `gemini-2.0-flash` | no | ADK LLM |
+| `ADK_MODEL` | `inclusionai/ling-3.0-flash-fin-free` | no | Agent LLM (LiteLLM / Vercel) |
+| `JEV_MODEL` | `typesafe-ai/jev` | no | Evaluation model |
 | `ADK_APP_NAME` | `educational-reel-agent` | no | ADK runner app name |
 | `PORT` | `8080` | no | Listen port (Cloud Run sets this) |
 | `HOST` | `0.0.0.0` | no | Bind address |
@@ -481,6 +527,7 @@ educational-reel-agent/
 | Symptom | Fix |
 | --- | --- |
 | `SARVAM_API_KEY is not set` | Put the key in `.env` or Secret Manager |
+| `VERCEL_AI_GATEWAY_API_KEY is not set` | Create a key at vercel.com/account/ai-gateway |
 | `unknown voice` / HTTP 422 | Use a name from the voice table |
 | `Storyboard not found` | Path must be under `STORYBOARDS_DIR` |
 | `reelgen executable not found` | Install reelgen or set `REELGEN_PYTHON` |

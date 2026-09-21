@@ -85,3 +85,15 @@ def test_pipeline_refuses_upload_without_render(isolated_dirs: Path):
             },
         )
         assert response.status_code == 400
+
+
+def test_evaluate_requires_gateway_key(isolated_dirs: Path):
+    from agent.main import app
+
+    with TestClient(app) as client:
+        response = client.post(
+            "/api/v1/evaluate",
+            json={"state": "Storyboard has five scenes.", "question": "Is the board complete?"},
+        )
+        assert response.status_code == 400
+        assert "VERCEL_AI_GATEWAY_API_KEY" in response.json()["detail"]

@@ -16,6 +16,7 @@ from fastapi.responses import FileResponse
 from agent.config import get_settings
 from agent.models import (
     BatchRenderRequest,
+    EvaluateRequest,
     HealthResponse,
     PipelineRequest,
     RenderRequest,
@@ -115,7 +116,10 @@ async def health_check() -> HealthResponse:
             "project": cfg.google_cloud_project,
             "region": cfg.google_cloud_region,
             "sarvam_configured": bool(cfg.sarvam_api_key),
+            "vercel_gateway_configured": bool(cfg.gateway_api_key),
             "adk_available": ADK_AVAILABLE,
+            "adk_model": cfg.adk_model,
+            "jev_model": cfg.jev_model,
             "output_dir": str(cfg.output_dir),
             "storyboards_dir": str(cfg.storyboards_dir),
         },
@@ -139,6 +143,7 @@ async def root() -> dict[str, Any]:
             "youtube_upload": "/api/v1/youtube/upload",
             "list_outputs": "/api/v1/outputs",
             "pipeline": "/api/v1/pipeline",
+            "evaluate": "/api/v1/evaluate",
         },
     }
 
@@ -154,6 +159,8 @@ async def get_info() -> dict[str, Any]:
         "preview_resolution": "540x960",
         "supported_formats": ["mp4"],
         "adk_model": cfg.adk_model,
+        "jev_model": cfg.jev_model,
+        "llm_provider": "litellm+vercel_ai_gateway",
     }
 
 
@@ -242,6 +249,15 @@ async def generate_social_copy_endpoint(request: SocialCopyRequest) -> dict[str,
             voice=request.voice,
             duration=request.duration,
         )
+    )
+
+
+@app.post("/api/v1/evaluate")
+async def evaluate_endpoint(request: EvaluateRequest) -> dict[str, Any]:
+    from agent.tools.eval_tools import evaluate_with_jev
+
+    return _tool_or_http(
+        evaluate_with_jev(state=request.state, question=request.question)
     )
 
 

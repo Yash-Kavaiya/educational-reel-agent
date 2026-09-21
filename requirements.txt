@@ -1,5 +1,6 @@
 # Educational Reel Agent - runtime (API + ADK tools)
-google-adk>=1.0.0,<3
+google-adk>=2.9.2,<3
+litellm>=1.84.0
 google-auth>=2.23.0
 google-auth-oauthlib>=1.1.0
 google-auth-httplib2>=0.1.1

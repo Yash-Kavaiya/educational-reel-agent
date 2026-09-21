@@ -118,6 +118,11 @@ class PipelineRequest(BaseModel):
     preview: bool = False
 
 
+class EvaluateRequest(BaseModel):
+    state: str = Field(..., min_length=1)
+    question: str = Field(..., min_length=1)
+
+
 class HealthResponse(BaseModel):
     status: str
     timestamp: str

@@ -20,12 +20,15 @@ class Settings(BaseSettings):
     google_cloud_project: str = ""
     google_cloud_region: str = "us-central1"
     sarvam_api_key: str = ""
+    vercel_ai_gateway_api_key: str = ""
+    ai_gateway_api_key: str = ""
 
     output_dir: Path = Field(default=Path("output"))
     storyboards_dir: Path = Field(default=Path("storyboards"))
     logs_dir: Path = Field(default=Path("logs"))
 
-    adk_model: str = "gemini-2.0-flash"
+    adk_model: str = "inclusionai/ling-3.0-flash-fin-free"
+    jev_model: str = "typesafe-ai/jev"
     adk_app_name: str = "educational-reel-agent"
     port: int = 8080
     host: str = "0.0.0.0"
@@ -47,7 +50,7 @@ class Settings(BaseSettings):
     default_handle: str = "@genai_guru"
     default_theme: str = "oracle"
     default_voice: str = "anushka"
-    app_version: str = "1.1.0"
+    app_version: str = "1.2.0"
 
     def ensure_directories(self) -> None:
         for path in (self.output_dir, self.storyboards_dir, self.logs_dir):
@@ -59,6 +62,10 @@ class Settings(BaseSettings):
     def cors_origin_list(self) -> list[str]:
         raw = [part.strip() for part in self.cors_origins.split(",") if part.strip()]
         return raw or ["*"]
+
+    @property
+    def gateway_api_key(self) -> str:
+        return self.vercel_ai_gateway_api_key or self.ai_gateway_api_key
 
 
 def get_settings() -> Settings:
