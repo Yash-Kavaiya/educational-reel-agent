@@ -1,328 +1,240 @@
-"""
-Oracle Reel Agent - FastAPI Application
-Main entry point for Cloud Run deployment
-"""
-import os
+"""Educational Reel Agent FastAPI application."""
+
+from __future__ import annotations
+
 import json
 import logging
-from pathlib import Path
-from typing import Dict, Any, List, Optional
-from datetime import datetime
 from contextlib import asynccontextmanager
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any
 
-from fastapi import FastAPI, HTTPException, BackgroundTasks, Query
-from fastapi.responses import JSONResponse, FileResponse
+from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel, Field
-from google.adk.agents import Agent
-from google.adk.tools import FunctionTool
-from google.adk.runners import Runner
-from google.adk.sessions import InMemorySessionService
+from fastapi.responses import FileResponse
 
-# Import our tools
+from agent.config import get_settings
+from agent.models import (
+    BatchRenderRequest,
+    HealthResponse,
+    PipelineRequest,
+    RenderRequest,
+    SocialCopyRequest,
+    StoryboardRequest,
+    YouTubeUploadRequest,
+)
+from agent.paths import resolve_existing_under, safe_under, slugify
 from agent.tools.reel_tools import (
-    create_storyboard,
-    render_reel,
-    batch_render_reels,
-    generate_social_copy,
-    register_tools,
     ORACLE_PALETTE,
     SARVAM_VOICES,
+    batch_render_reels,
+    create_storyboard,
+    generate_social_copy,
+    render_reel,
 )
 
-# Configure logging
+logger = logging.getLogger(__name__)
 logging.basicConfig(
     level=logging.INFO,
-    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s"
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
 )
-logger = logging.getLogger(__name__)
 
-# Configuration
-GOOGLE_CLOUD_PROJECT = os.getenv("GOOGLE_CLOUD_PROJECT", "")
-GOOGLE_CLOUD_REGION = os.getenv("GOOGLE_CLOUD_REGION", "us-central1")
-SARVAM_API_KEY = os.getenv("SARVAM_API_KEY", "")
-OUTPUT_DIR = Path(os.getenv("OUTPUT_DIR", "/app/output"))
-STORYBOARDS_DIR = Path(os.getenv("STORYBOARDS_DIR", "/app/storyboards"))
-LOGS_DIR = Path(os.getenv("LOGS_DIR", "/app/logs"))
-
-# Ensure directories exist
-OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
-STORYBOARDS_DIR.mkdir(parents=True, exist_ok=True)
-LOGS_DIR.mkdir(parents=True, exist_ok=True)
-
-# Global state
+ADK_AVAILABLE = False
 runner = None
 session_service = None
-agent_instance = None
+
+try:
+    from google.adk.runners import Runner
+    from google.adk.sessions import InMemorySessionService
+
+    ADK_AVAILABLE = True
+except ImportError:
+    logger.warning("google-adk is not installed; /chat-style ADK runner is disabled")
 
 
-# =============================================================================
-# Pydantic Models
-# =============================================================================
+def _utc_now() -> str:
+    return datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
 
-class StoryboardRequest(BaseModel):
-    topic: str = Field(..., description="Main topic/title of the reel")
-    content: str = Field(..., description="Detailed content to cover")
-    reel_number: int = Field(1, ge=1, description="Reel number in series")
-    total_reels: int = Field(1, ge=1, description="Total reels in series")
-    voice: str = Field("anushka", description="Sarvam AI voice to use")
-    series_title: str = Field("Oracle AI Agents", description="Series title")
-
-
-class RenderRequest(BaseModel):
-    storyboard_path: str = Field(..., description="Path to storyboard JSON")
-    output_filename: Optional[str] = Field(None, description="Custom output filename")
-    preview: bool = Field(False, description="Render preview (540x960)")
-
-
-class BatchRenderRequest(BaseModel):
-    series_title: str = Field(..., description="Series title")
-    topics: List[Dict[str, Any]] = Field(..., description="List of topic objects with topic, content, voice")
-    preview: bool = Field(False, description="Render previews")
-
-
-class SocialCopyRequest(BaseModel):
-    topic: str = Field(..., description="Reel topic")
-    reel_number: int = Field(1, ge=1)
-    total_reels: int = Field(1, ge=1)
-    series_title: str = Field("Oracle AI Agents")
-    voice: str = Field("anushka")
-    duration: str = Field("60s")
-
-
-class YouTubeUploadRequest(BaseModel):
-    video_path: str = Field(..., description="Path to video file")
-    title: str = Field(..., description="Video title")
-    description: str = Field(..., description="Video description")
-    tags: List[str] = Field(default_factory=list)
-    privacy_status: str = Field("unlisted", pattern="^(private|unlisted|public)$")
-    category_id: str = Field("28")
-
-
-class HealthResponse(BaseModel):
-    status: str
-    timestamp: str
-    version: str
-    environment: Dict[str, Any]
-
-
-# =============================================================================
-# Application Lifecycle
-# =============================================================================
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    """Application lifespan manager"""
-    global runner, session_service, agent_instance
-    
-    logger.info("Starting Oracle Reel Agent...")
-    
-    # Initialize ADK components
-    session_service = InMemorySessionService()
-    
-    # Create agent with tools
-    tools = register_tools()
-    agent_instance = Agent(
-        name="oracle_reel_creator",
-        model="gemini-2.0-flash",
-        description="Oracle-branded AI Reel Creator with Sarvam AI voiceovers",
-        instruction="""You are an expert AI Reel Creator specializing in Oracle-branded educational content.
-Create high-quality vertical reels (1080x1920) with Oracle Red (#E01C24) and Orange (#FF6600) theme.""",
-        tools=tools,
-    )
-    
-    runner = Runner(
-        agent=agent_instance,
-        app_name="oracle-reel-agent",
-        session_service=session_service,
-    )
-    
-    logger.info("Oracle Reel Agent started successfully")
+    global runner, session_service
+    settings = get_settings()
+    settings.ensure_directories()
+    logger.info("Starting Educational Reel Agent v%s", settings.app_version)
+
+    if ADK_AVAILABLE:
+        from agent.agent import root_agent
+
+        session_service = InMemorySessionService()
+        runner = Runner(
+            agent=root_agent,
+            app_name=settings.adk_app_name,
+            session_service=session_service,
+        )
+        logger.info("ADK runner ready (model=%s)", settings.adk_model)
+    else:
+        logger.info("ADK runner skipped")
+
     yield
-    
-    logger.info("Shutting down Oracle Reel Agent...")
+    logger.info("Shutting down Educational Reel Agent")
 
 
-# =============================================================================
-# FastAPI App
-# =============================================================================
-
+settings = get_settings()
 app = FastAPI(
-    title="Oracle Reel Agent API",
-    description="AI-powered Oracle-branded reel generation with Sarvam AI voiceovers and YouTube publishing",
-    version="1.0.0",
+    title="Educational Reel Agent API",
+    description="ADK educational reel generation with Sarvam AI voiceovers",
+    version=settings.app_version,
     lifespan=lifespan,
 )
 
-# CORS middleware
+_origins = settings.cors_origin_list()
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
+    allow_origins=_origins,
+    allow_credentials="*" not in _origins,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
 
-# =============================================================================
-# Health & Info Endpoints
-# =============================================================================
+def _tool_or_http(result: dict[str, Any]) -> dict[str, Any]:
+    if result.get("status") == "error":
+        raise HTTPException(status_code=400, detail=result.get("error") or "tool error")
+    return result
+
 
 @app.get("/health", response_model=HealthResponse)
-async def health_check():
-    """Health check endpoint for Cloud Run"""
+async def health_check() -> HealthResponse:
+    cfg = get_settings()
     return HealthResponse(
         status="healthy",
-        timestamp=datetime.utcnow().isoformat() + "Z",
-        version="1.0.0",
+        timestamp=_utc_now(),
+        version=cfg.app_version,
         environment={
-            "project": GOOGLE_CLOUD_PROJECT,
-            "region": GOOGLE_CLOUD_REGION,
-            "sarvam_configured": bool(SARVAM_API_KEY),
-            "output_dir": str(OUTPUT_DIR),
-            "storyboards_dir": str(STORYBOARDS_DIR),
-        }
+            "project": cfg.google_cloud_project,
+            "region": cfg.google_cloud_region,
+            "sarvam_configured": bool(cfg.sarvam_api_key),
+            "adk_available": ADK_AVAILABLE,
+            "output_dir": str(cfg.output_dir),
+            "storyboards_dir": str(cfg.storyboards_dir),
+        },
     )
 
 
 @app.get("/")
-async def root():
-    """Root endpoint"""
+async def root() -> dict[str, Any]:
+    cfg = get_settings()
     return {
-        "name": "Oracle Reel Agent API",
-        "version": "1.0.0",
-        "description": "AI-powered Oracle-branded reel generation with Sarvam AI voiceovers",
+        "name": "Educational Reel Agent API",
+        "version": cfg.app_version,
+        "description": "AI-powered educational reel generation with Sarvam AI voiceovers",
         "endpoints": {
             "health": "/health",
+            "docs": "/docs",
             "create_storyboard": "/api/v1/storyboards",
             "render_reel": "/api/v1/render",
             "batch_render": "/api/v1/batch-render",
             "social_copy": "/api/v1/social-copy",
             "youtube_upload": "/api/v1/youtube/upload",
             "list_outputs": "/api/v1/outputs",
-        }
+            "pipeline": "/api/v1/pipeline",
+        },
     }
 
 
 @app.get("/api/v1/info")
-async def get_info():
-    """Get agent configuration info"""
+async def get_info() -> dict[str, Any]:
+    cfg = get_settings()
     return {
         "oracle_palette": ORACLE_PALETTE,
         "sarvam_voices": SARVAM_VOICES,
-        "default_series": "Oracle AI Agents",
+        "default_series": cfg.default_series_title,
         "output_resolution": "1080x1920",
         "preview_resolution": "540x960",
         "supported_formats": ["mp4"],
+        "adk_model": cfg.adk_model,
     }
 
 
-# =============================================================================
-# Storyboard Endpoints
-# =============================================================================
-
-@app.post("/api/v1/storyboards", response_model=Dict[str, Any])
-async def create_storyboard_endpoint(request: StoryboardRequest):
-    """Create a new storyboard for a reel"""
-    try:
-        result = create_storyboard(
-            topic=request.topic,
-            content=request.content,
-            reel_number=request.reel_number,
-            total_reels=request.total_reels,
-            voice=request.voice,
-            series_title=request.series_title,
-        )
-        return result
-    except Exception as e:
-        logger.error(f"Storyboard creation failed: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
+@app.post("/api/v1/storyboards")
+async def create_storyboard_endpoint(request: StoryboardRequest) -> dict[str, Any]:
+    result = create_storyboard(
+        topic=request.topic,
+        content=request.content,
+        reel_number=request.reel_number,
+        total_reels=request.total_reels,
+        voice=request.voice,
+        series_title=request.series_title,
+    )
+    return _tool_or_http(result)
 
 
 @app.get("/api/v1/storyboards")
-async def list_storyboards(series: Optional[str] = None):
-    """List all storyboards"""
-    try:
-        if series:
-            series_dir = STORYBOARDS_DIR / series.lower().replace(" ", "-")
-        else:
-            series_dir = STORYBOARDS_DIR
-        
-        if not series_dir.exists():
-            return {"storyboards": []}
-        
-        storyboards = []
-        for sb_file in series_dir.glob("*.json"):
-            with open(sb_file) as f:
-                data = json.load(f)
-            storyboards.append({
+async def list_storyboards(series: str | None = None) -> dict[str, Any]:
+    cfg = get_settings()
+    root = cfg.storyboards_dir
+    if series:
+        series_dir = root / slugify(series)
+        files = series_dir.glob("*.json") if series_dir.exists() else []
+    else:
+        files = root.rglob("*.json") if root.exists() else []
+
+    storyboards = []
+    for sb_file in files:
+        try:
+            data = json.loads(sb_file.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            logger.warning("Skipping unreadable storyboard %s", sb_file)
+            continue
+        storyboards.append(
+            {
                 "file": sb_file.name,
                 "title": data.get("title"),
                 "voice": data.get("voice"),
                 "scenes": len(data.get("scenes", [])),
-                "series": series_dir.name,
-            })
-        
-        return {"storyboards": sorted(storyboards, key=lambda x: x["file"])}
-    except Exception as e:
-        logger.error(f"List storyboards failed: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
+                "series": sb_file.parent.name,
+            }
+        )
+    return {"storyboards": sorted(storyboards, key=lambda item: item["file"])}
 
 
 @app.get("/api/v1/storyboards/{series}/{filename}")
-async def get_storyboard(series: str, filename: str):
-    """Get a specific storyboard"""
-    filepath = STORYBOARDS_DIR / series.lower().replace(" ", "-") / filename
-    if not filepath.exists():
-        raise HTTPException(status_code=404, detail="Storyboard not found")
-    
-    with open(filepath) as f:
-        return json.load(f)
-
-
-# =============================================================================
-# Render Endpoints
-# =============================================================================
-
-@app.post("/api/v1/render", response_model=Dict[str, Any])
-async def render_reel_endpoint(request: RenderRequest, background_tasks: BackgroundTasks):
-    """Render a single reel from storyboard"""
+async def get_storyboard(series: str, filename: str) -> dict[str, Any]:
+    cfg = get_settings()
     try:
-        result = render_reel(
+        filepath = safe_under(cfg.storyboards_dir, Path(slugify(series)) / Path(filename).name)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    if filepath.suffix != ".json" or not filepath.is_file():
+        raise HTTPException(status_code=404, detail="Storyboard not found")
+    return json.loads(filepath.read_text(encoding="utf-8"))
+
+
+@app.post("/api/v1/render")
+async def render_reel_endpoint(request: RenderRequest) -> dict[str, Any]:
+    return _tool_or_http(
+        render_reel(
             storyboard_path=request.storyboard_path,
             output_filename=request.output_filename,
             preview=request.preview,
         )
-        return result
-    except Exception as e:
-        logger.error(f"Render failed: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
+    )
 
 
-@app.post("/api/v1/batch-render", response_model=Dict[str, Any])
-async def batch_render_endpoint(request: BatchRenderRequest, background_tasks: BackgroundTasks):
-    """Batch render multiple reels for a series"""
-    try:
-        result = batch_render_reels(
-            series_title=request.series_title,
-            topics=request.topics,
-            preview=request.preview,
-        )
-        return result
-    except Exception as e:
-        logger.error(f"Batch render failed: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
+@app.post("/api/v1/batch-render")
+async def batch_render_endpoint(request: BatchRenderRequest) -> dict[str, Any]:
+    return batch_render_reels(
+        series_title=request.series_title,
+        topics=[item.model_dump() for item in request.topics],
+        preview=request.preview,
+    )
 
 
-# =============================================================================
-# Social Copy Endpoints
-# =============================================================================
-
-@app.post("/api/v1/social-copy", response_model=Dict[str, Any])
-async def generate_social_copy_endpoint(request: SocialCopyRequest):
-    """Generate platform-optimized social media copy"""
-    try:
-        result = generate_social_copy(
+@app.post("/api/v1/social-copy")
+async def generate_social_copy_endpoint(request: SocialCopyRequest) -> dict[str, Any]:
+    return _tool_or_http(
+        generate_social_copy(
             topic=request.topic,
             reel_number=request.reel_number,
             total_reels=request.total_reels,
@@ -330,102 +242,76 @@ async def generate_social_copy_endpoint(request: SocialCopyRequest):
             voice=request.voice,
             duration=request.duration,
         )
-        return result
-    except Exception as e:
-        logger.error(f"Social copy generation failed: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
+    )
 
 
-# =============================================================================
-# YouTube Endpoints
-# =============================================================================
+@app.post("/api/v1/youtube/upload")
+async def upload_to_youtube_endpoint(request: YouTubeUploadRequest) -> dict[str, Any]:
+    from agent.tools.youtube_tools import upload_video_to_youtube
 
-@app.post("/api/v1/youtube/upload", response_model=Dict[str, Any])
-async def upload_to_youtube_endpoint(request: YouTubeUploadRequest):
-    """Upload a video to YouTube"""
+    cfg = get_settings()
     try:
-        from agent.tools.youtube_tools import upload_video_to_youtube
-        
-        result = upload_video_to_youtube(
-            video_path=request.video_path,
-            title=request.title,
-            description=request.description,
-            tags=request.tags,
-            category_id=request.category_id,
-            privacy_status=request.privacy_status,
-        )
-        return result
-    except Exception as e:
-        logger.error(f"YouTube upload failed: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
+        video_path = resolve_existing_under(cfg.output_dir, request.video_path)
+    except (ValueError, FileNotFoundError) as exc:
+        raise HTTPException(status_code=400, detail=f"video not found: {exc}") from exc
+    result = upload_video_to_youtube(
+        video_path=str(video_path),
+        title=request.title,
+        description=request.description,
+        tags=request.tags,
+        category_id=request.category_id,
+        privacy_status=request.privacy_status,
+    )
+    return _tool_or_http(result)
 
-
-# =============================================================================
-# Output Management
-# =============================================================================
 
 @app.get("/api/v1/outputs")
-async def list_outputs(series: Optional[str] = None):
-    """List all rendered outputs"""
-    try:
-        if series:
-            output_dir = OUTPUT_DIR / series.lower().replace(" ", "-")
-        else:
-            output_dir = OUTPUT_DIR
-        
-        if not output_dir.exists():
-            return {"outputs": []}
-        
-        outputs = []
-        for video_file in output_dir.glob("*.mp4"):
-            stat = video_file.stat()
-            outputs.append({
+async def list_outputs(series: str | None = Query(default=None)) -> dict[str, Any]:
+    cfg = get_settings()
+    root = cfg.output_dir
+    if series:
+        output_dir = root / slugify(series)
+        files = output_dir.glob("*.mp4") if output_dir.exists() else []
+    else:
+        files = root.rglob("*.mp4") if root.exists() else []
+
+    outputs = []
+    for video_file in files:
+        stat = video_file.stat()
+        outputs.append(
+            {
                 "filename": video_file.name,
                 "path": str(video_file),
                 "size_bytes": stat.st_size,
                 "size_mb": round(stat.st_size / (1024 * 1024), 2),
-                "modified": datetime.fromtimestamp(stat.st_mtime).isoformat(),
-                "series": series or output_dir.name,
-            })
-        
-        return {"outputs": sorted(outputs, key=lambda x: x["filename"])}
-    except Exception as e:
-        logger.error(f"List outputs failed: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
+                "modified": datetime.fromtimestamp(stat.st_mtime, tz=timezone.utc).isoformat(),
+                "series": series or video_file.parent.name,
+            }
+        )
+    return {"outputs": sorted(outputs, key=lambda item: item["filename"])}
 
 
 @app.get("/api/v1/outputs/{series}/{filename}")
-async def download_output(series: str, filename: str):
-    """Download a rendered video"""
-    filepath = OUTPUT_DIR / series.lower().replace(" ", "-") / filename
-    if not filepath.exists():
+async def download_output(series: str, filename: str) -> FileResponse:
+    cfg = get_settings()
+    try:
+        filepath = safe_under(cfg.output_dir, Path(slugify(series)) / Path(filename).name)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    if filepath.suffix.lower() != ".mp4" or not filepath.is_file():
         raise HTTPException(status_code=404, detail="File not found")
-    
-    return FileResponse(
-        filepath,
-        media_type="video/mp4",
-        filename=filename,
-    )
+    return FileResponse(filepath, media_type="video/mp4", filename=filepath.name)
 
 
-# =============================================================================
-# Pipeline Endpoint (Complete workflow)
-# =============================================================================
+@app.post("/api/v1/pipeline")
+async def run_pipeline(request: PipelineRequest) -> dict[str, Any]:
+    if request.upload_youtube and not request.render:
+        raise HTTPException(
+            status_code=400,
+            detail="upload_youtube requires render=true",
+        )
 
-class PipelineRequest(BaseModel):
-    series_title: str = Field(..., description="Series title")
-    topics: List[Dict[str, Any]] = Field(..., description="Topics with content")
-    render: bool = Field(True, description="Render videos")
-    generate_social: bool = Field(True, description="Generate social copy")
-    upload_youtube: bool = Field(False, description="Upload to YouTube")
-    youtube_privacy: str = Field("unlisted", pattern="^(private|unlisted|public)$")
-    preview: bool = Field(False, description="Use preview quality")
-
-
-@app.post("/api/v1/pipeline", response_model=Dict[str, Any])
-async def run_pipeline(request: PipelineRequest, background_tasks: BackgroundTasks):
-    """Run complete pipeline: storyboards -> render -> social copy -> youtube"""
-    results = {
+    results: dict[str, Any] = {
         "series": request.series_title,
         "storyboards": [],
         "renders": [],
@@ -433,112 +319,93 @@ async def run_pipeline(request: PipelineRequest, background_tasks: BackgroundTas
         "youtube_uploads": [],
         "status": "started",
     }
-    
+
     try:
-        # 1. Create storyboards
-        for i, topic_info in enumerate(request.topics, 1):
+        for index, topic_info in enumerate(request.topics, 1):
             sb_result = create_storyboard(
-                topic=topic_info["topic"],
-                content=topic_info.get("content", ""),
-                reel_number=i,
+                topic=topic_info.topic,
+                content=topic_info.content,
+                reel_number=index,
                 total_reels=len(request.topics),
-                voice=topic_info.get("voice", "anushka"),
+                voice=topic_info.voice,
                 series_title=request.series_title,
             )
             results["storyboards"].append(sb_result)
-        
-        # 2. Render reels
+
         if request.render:
-            for sb in results["storyboards"]:
-                if sb["status"] == "success":
-                    output_name = f"{request.series_title.lower().replace(' ', '-')}-{sb.get('reel_number', 1):02d}-{sb['topic'].lower().replace(' ', '-')}-hd.mp4"
-                    render_result = render_reel(
-                        storyboard_path=sb["storyboard_path"],
-                        output_filename=output_name,
-                        preview=request.preview,
-                    )
-                    render_result["topic"] = sb["topic"]
-                    results["renders"].append(render_result)
-        
-        # 3. Generate social copy
-        if request.generate_social:
-            for i, topic_info in enumerate(request.topics, 1):
-                # Find corresponding render for duration
-                duration = "60s"
-                for r in results["renders"]:
-                    if r.get("topic") == topic_info["topic"] and r.get("duration"):
-                        duration = r["duration"]
-                        break
-                
-                sc_result = generate_social_copy(
-                    topic=topic_info["topic"],
-                    reel_number=i,
-                    total_reels=len(request.topics),
-                    series_title=request.series_title,
-                    voice=topic_info.get("voice", "anushka"),
-                    duration=duration,
+            for storyboard in results["storyboards"]:
+                if storyboard.get("status") != "success":
+                    continue
+                output_name = (
+                    f"{slugify(request.series_title)}-"
+                    f"{storyboard['reel_number']:02d}-"
+                    f"{slugify(storyboard['topic'])}-hd.mp4"
                 )
-                results["social_copy"].append(sc_result)
-        
-        # 4. Upload to YouTube (if requested and renders successful)
-        if request.upload_youtube:
-            for r in results["renders"]:
-                if r["status"] == "success":
-                    # Find social copy for this topic
-                    sc = next((s for s in results["social_copy"] if s["topic"] == r["topic"]), None)
-                    yt_data = sc["social_copy"]["youtube"] if sc else {"title": r["topic"], "description": "", "tags": []}
-                    
-                    yt_result = upload_video_to_youtube(
-                        video_path=r["output_path"],
-                        title=yt_data["title"],
-                        description=yt_data["description"],
-                        tags=yt_data.get("tags", []),
-                        privacy_status=request.youtube_privacy,
+                render_result = render_reel(
+                    storyboard_path=storyboard["storyboard_path"],
+                    output_filename=output_name,
+                    preview=request.preview,
+                )
+                render_result["topic"] = storyboard["topic"]
+                results["renders"].append(render_result)
+
+        if request.generate_social:
+            for index, topic_info in enumerate(request.topics, 1):
+                duration = "60s"
+                for item in results["renders"]:
+                    if item.get("topic") == topic_info.topic and item.get("duration"):
+                        duration = item["duration"]
+                        break
+                results["social_copy"].append(
+                    generate_social_copy(
+                        topic=topic_info.topic,
+                        reel_number=index,
+                        total_reels=len(request.topics),
+                        series_title=request.series_title,
+                        voice=topic_info.voice,
+                        duration=duration,
                     )
-                    yt_result["topic"] = r["topic"]
-                    results["youtube_uploads"].append(yt_result)
-        
+                )
+
+        if request.upload_youtube:
+            from agent.tools.youtube_tools import upload_video_to_youtube
+
+            for item in results["renders"]:
+                if item.get("status") != "success":
+                    continue
+                social = next(
+                    (row for row in results["social_copy"] if row.get("topic") == item["topic"]),
+                    None,
+                )
+                yt_data = (
+                    social["social_copy"]["youtube"]
+                    if social and social.get("status") == "success"
+                    else {"title": item["topic"], "description": item["topic"], "tags": []}
+                )
+                yt_result = upload_video_to_youtube(
+                    video_path=item["output_path"],
+                    title=yt_data["title"],
+                    description=yt_data["description"],
+                    tags=yt_data.get("tags", []),
+                    privacy_status=request.youtube_privacy,
+                )
+                yt_result["topic"] = item["topic"]
+                results["youtube_uploads"].append(yt_result)
+
         results["status"] = "completed"
         return results
-        
-    except Exception as e:
-        logger.error(f"Pipeline failed: {e}")
+    except HTTPException:
+        raise
+    except Exception as exc:
+        logger.exception("Pipeline failed")
         results["status"] = "failed"
-        results["error"] = str(e)
-        raise HTTPException(status_code=500, detail=str(e))
+        results["error"] = str(exc)
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
 
-
-# =============================================================================
-# YouTube Tool Import (lazy to avoid import errors)
-# =============================================================================
-
-def upload_video_to_youtube(
-    video_path: str,
-    title: str,
-    description: str,
-    tags: list = None,
-    category_id: str = "28",
-    privacy_status: str = "unlisted",
-    thumbnail_path: str = None
-) -> Dict[str, Any]:
-    """Upload video to YouTube - wrapper for youtube_tools"""
-    from agent.tools.youtube_tools import upload_video_to_youtube as yt_upload
-    return yt_upload(
-        video_path=video_path,
-        title=title,
-        description=description,
-        tags=tags,
-        category_id=category_id,
-        privacy_status=privacy_status,
-        thumbnail_path=thumbnail_path
-    )
-
-
-# =============================================================================
-# Main entry point
-# =============================================================================
 
 if __name__ == "__main__":
+    import os
+
     import uvicorn
-    port = int(os.getenv("PORT", "8080"))
-    uvicorn.run(app, host="0.0.0.0", port=port)
+
+    uvicorn.run(app, host=os.getenv("HOST", "0.0.0.0"), port=int(os.getenv("PORT", "8080")))

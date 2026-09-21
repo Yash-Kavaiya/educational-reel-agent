@@ -1,12 +1,8 @@
-# Oracle Reel Agent - Cloud Run Deployment
-# Multi-stage build for minimal production image
+# Educational Reel Agent - Cloud Run image
+# Multi-stage build. Render extras (Manim) are optional via INSTALL_RENDER.
 
-# =============================================================================
-# Build Stage - Install dependencies and build
-# =============================================================================
-FROM python:3.11-slim as builder
+FROM python:3.11-slim-bookworm AS builder
 
-# Install system dependencies for manim, ffmpeg, and Google Cloud libraries
 RUN apt-get update && apt-get install -y --no-install-recommends \
     ffmpeg \
     libcairo2-dev \
@@ -14,32 +10,28 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libgdk-pixbuf-2.0-dev \
     libffi-dev \
     libxml2-dev \
-    libxslt-dev \
+    libxslt1-dev \
     libssl-dev \
     pkg-config \
     build-essential \
-    git \
-    curl \
     && rm -rf /var/lib/apt/lists/*
 
-# Set up Python environment
 ENV PYTHONUNBUFFERED=1 \
     PYTHONDONTWRITEBYTECODE=1 \
     PIP_NO_CACHE_DIR=1 \
-    PIP_DISABLE_PIP_VERSION_CHECK=1
+    PIP_DISABLE_PIP_VERSION_CHECK=1 \
+    PATH="/opt/venv/bin:$PATH"
 
 WORKDIR /app
+RUN python -m venv /opt/venv
+COPY requirements.txt requirements-render.txt ./
+ARG INSTALL_RENDER=true
+RUN pip install --upgrade pip \
+    && pip install -r requirements.txt \
+    && if [ "$INSTALL_RENDER" = "true" ]; then pip install -r requirements-render.txt; fi
 
-# Copy requirements first for better caching
-COPY requirements.txt .
-RUN pip install --no-cache-dir --user -r requirements.txt
+FROM python:3.11-slim-bookworm AS runtime
 
-# =============================================================================
-# Runtime Stage - Minimal production image
-# =============================================================================
-FROM python:3.11-slim as runtime
-
-# Install runtime dependencies only
 RUN apt-get update && apt-get install -y --no-install-recommends \
     ffmpeg \
     libcairo2 \
@@ -48,42 +40,32 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libxml2 \
     libxslt1.1 \
     libssl3 \
-    curl \
-    && rm -rf /var/lib/apt/lists/* \
-    && apt-get clean
+    && rm -rf /var/lib/apt/lists/*
 
-# Create non-root user for security
-RUN groupadd -r appuser && useradd -r -g appuser appuser
+RUN groupadd -r appuser && useradd -r -g appuser -m appuser
 
-# Set up Python environment
 ENV PYTHONUNBUFFERED=1 \
     PYTHONDONTWRITEBYTECODE=1 \
-    PATH="/home/appuser/.local/bin:$PATH" \
-    PYTHONPATH="/app:/app/agent"
+    PATH="/opt/venv/bin:$PATH" \
+    PYTHONPATH="/app" \
+    OUTPUT_DIR="/app/output" \
+    STORYBOARDS_DIR="/app/storyboards" \
+    LOGS_DIR="/app/logs"
 
 WORKDIR /app
 
-# Copy installed packages from builder
-COPY --from=builder /root/.local /home/appuser/.local
-
-# Copy application code
+COPY --from=builder /opt/venv /opt/venv
 COPY agent/ ./agent/
-COPY entrypoint.sh .
-COPY healthcheck.py .
+COPY entrypoint.sh healthcheck.py ./
 
-# Create directories for outputs and storyboards
-RUN mkdir -p /app/output /app/storyboards /app/logs && \
-    chown -R appuser:appuser /app
+RUN mkdir -p /app/output /app/storyboards /app/logs \
+    && chmod +x /app/entrypoint.sh \
+    && chown -R appuser:appuser /app
 
-# Switch to non-root user
 USER appuser
 
-# Health check
-HEALTHCHECK --interval=30s --timeout=10s --start-period=30s --retries=3 \
-    CMD python healthcheck.py
+HEALTHCHECK --interval=30s --timeout=10s --start-period=40s --retries=3 \
+    CMD python /app/healthcheck.py
 
-# Expose port (Cloud Run uses PORT env var)
 EXPOSE 8080
-
-# Entrypoint
 ENTRYPOINT ["./entrypoint.sh"]
